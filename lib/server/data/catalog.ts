@@ -1,11 +1,17 @@
-// In-memory demo catalog + prereq graph + program requirements.
-// Ported 1:1 from backend/app/data/catalog.py.
+// Offline course fixture.
 //
-// The Supabase-backed catalog (see services/catalog.ts) is authoritative
-// at query time; this static dataset is only used by the deterministic
-// resolver + fallback tests and by any code path that needs to reason
-// offline. Never mix the two — the demo dataset is a subset of what
-// lives in Supabase.
+// After the pivot to Claude Agent SDK + MCP, *real* course data comes
+// from the `university-catalog` MCP server (Purdue.io) and lands in the
+// Supabase `course_cache` table (see phase 3). This file exists solely
+// as a deterministic fixture for the rules-engine + track-builder unit
+// tests, which must run offline with no network. The tests exercise
+// the algorithm; production runs the algorithm over cached Purdue data.
+//
+// If a new course code shows up in `lib/server/data/programs/*.ts` that
+// isn't in this fixture, add a `course(...)` row here so `lookupCourse`
+// can back the offline tests. Don't reach for this map at runtime from
+// any route handler or agent tool — that path goes through the MCP
+// server.
 
 export type Term = "Fall" | "Spring" | "Summer";
 
@@ -16,6 +22,8 @@ export interface CatalogCourse {
   terms_offered: readonly Term[];
   description: string;
   prerequisites: readonly string[];
+  corequisites?: readonly string[];
+  tags?: readonly string[];
 }
 
 function course(
@@ -25,8 +33,18 @@ function course(
   terms_offered: readonly Term[],
   description: string,
   prerequisites: readonly string[] = [],
+  extras: { corequisites?: readonly string[]; tags?: readonly string[] } = {},
 ): CatalogCourse {
-  return { code, title, credits, terms_offered, description, prerequisites };
+  return {
+    code,
+    title,
+    credits,
+    terms_offered,
+    description,
+    prerequisites,
+    ...(extras.corequisites ? { corequisites: extras.corequisites } : {}),
+    ...(extras.tags ? { tags: extras.tags } : {}),
+  };
 }
 
 export const COURSES: Readonly<Record<string, CatalogCourse>> = {
@@ -44,10 +62,25 @@ export const COURSES: Readonly<Record<string, CatalogCourse>> = {
     ["CS 301", "CS 340"]),
   "CS 410": course("CS 410", "Databases", 3, ["Spring"],
     "Relational modeling, SQL, and transaction management.", ["CS 201"]),
+  "MATH 120": course("MATH 120", "Calculus I", 4, ["Fall", "Spring"],
+    "Limits, derivatives, and the fundamental theorem of calculus."),
   "MATH 210": course("MATH 210", "Discrete Mathematics", 3, ["Fall", "Spring"],
     "Logic, sets, combinatorics, and proofs."),
+  "MATH 220": course("MATH 220", "Calculus II", 4, ["Fall", "Spring"],
+    "Integration techniques, series, and Taylor expansions.", ["MATH 120"]),
+  "MATH 240": course("MATH 240", "Linear Algebra", 3, ["Fall", "Spring"],
+    "Vector spaces, matrices, eigenvalues, and applications.", ["MATH 120"]),
+  "MATH 260": course("MATH 260", "Multivariable Calculus", 4, ["Fall", "Spring"],
+    "Vector calculus, partial derivatives, and multiple integrals.", ["MATH 220"]),
+  "MATH 310": course("MATH 310", "Ordinary Differential Equations", 3, ["Spring"],
+    "First and higher-order ODEs, systems, Laplace transforms.", ["MATH 220"]),
+  "MATH 340": course("MATH 340", "Real Analysis", 3, ["Fall"],
+    "Rigorous treatment of sequences, series, and continuity.",
+    ["MATH 220", "MATH 210"]),
+  "MATH 360": course("MATH 360", "Abstract Algebra", 3, ["Spring"],
+    "Groups, rings, and fields with proofs.", ["MATH 210", "MATH 240"]),
   "BUS 101": course("BUS 101", "Intro to Business", 3, ["Fall", "Spring"],
-    "Overview of business functions and management."),
+    "Overview of business functions and management.", [], { tags: ["ge-social"] }),
   "BUS 210": course("BUS 210", "Financial Accounting", 3, ["Fall", "Spring"],
     "Financial statements and accounting principles.", ["BUS 101"]),
   "BUS 220": course("BUS 220", "Managerial Accounting", 3, ["Spring"],
@@ -57,7 +90,7 @@ export const COURSES: Readonly<Record<string, CatalogCourse>> = {
   "BUS 350": course("BUS 350", "Corporate Finance", 3, ["Fall"],
     "Capital budgeting, valuation, and financing decisions.", ["BUS 210"]),
   "PSY 101": course("PSY 101", "Intro to Psychology", 3, ["Fall", "Spring"],
-    "Behavior, cognition, and research methods."),
+    "Behavior, cognition, and research methods.", [], { tags: ["ge-social"] }),
   "PSY 220": course("PSY 220", "Developmental Psychology", 3, ["Fall", "Spring"],
     "Human development across the lifespan.", ["PSY 101"]),
   "PSY 305": course("PSY 305", "Cognitive Psychology", 3, ["Fall"],
@@ -67,38 +100,10 @@ export const COURSES: Readonly<Record<string, CatalogCourse>> = {
   "PSY 410": course("PSY 410", "Abnormal Psychology", 3, ["Spring"],
     "Clinical disorders and treatment approaches.", ["PSY 220", "PSY 305"]),
   "ENG 150": course("ENG 150", "Composition & Rhetoric", 3, ["Fall", "Spring", "Summer"],
-    "General education writing course."),
+    "General education writing course.", [], { tags: ["ge-writing"] }),
   "STAT 220": course("STAT 220", "Applied Statistics", 3, ["Fall", "Spring"],
-    "Descriptive and inferential statistics."),
+    "Descriptive and inferential statistics.", [], { tags: ["ge-quantitative"] }),
 };
-
-export type MajorId = "cs" | "business" | "psych";
-
-export interface Major {
-  id: MajorId;
-  name: string;
-  required_courses: readonly string[];
-}
-
-export const MAJORS: Readonly<Record<MajorId, Major>> = {
-  cs: {
-    id: "cs",
-    name: "Computer Science",
-    required_courses: ["CS 101", "CS 201", "CS 301", "CS 340", "CS 402", "MATH 210"],
-  },
-  business: {
-    id: "business",
-    name: "Business Administration",
-    required_courses: ["BUS 101", "BUS 210", "BUS 220", "BUS 310", "BUS 350"],
-  },
-  psych: {
-    id: "psych",
-    name: "Psychology",
-    required_courses: ["PSY 101", "PSY 220", "PSY 305", "PSY 340", "PSY 410", "STAT 220"],
-  },
-};
-
-export const DEMO_COURSES = ["CS 301", "BUS 350", "PSY 340", "BIO 210", "ENG 150"] as const;
 
 export function normalizeCourse(code: string): string {
   return code.trim().toUpperCase().split(/\s+/).join(" ");
@@ -114,8 +119,8 @@ export function prereqsOf(code: string): readonly string[] {
 
 /**
  * Transitive downstream: every course whose prereq chain reaches `code`.
- * Iterative BFS over COURSES so we don't stack-overflow on any future
- * long chain, and so ordering is deterministic (sorted at the end).
+ * Iterative BFS so long chains never stack-overflow, and ordering is
+ * deterministic (sorted at the end).
  */
 export function downstreamOf(code: string): string[] {
   const target = normalizeCourse(code);
@@ -131,13 +136,4 @@ export function downstreamOf(code: string): string[] {
     }
   }
   return [...visited].sort();
-}
-
-export type RequiredForResult = boolean | "unknown";
-
-export function isRequiredFor(code: string, major: MajorId | null | undefined): RequiredForResult {
-  if (!major) return "unknown";
-  const row = MAJORS[major];
-  if (!row) return "unknown";
-  return row.required_courses.includes(normalizeCourse(code));
 }

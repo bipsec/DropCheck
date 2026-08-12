@@ -120,6 +120,23 @@ export function buildSessionSetCookie(sessionId: string): string {
   });
 }
 
+/**
+ * Header value that clears the session cookie. Used by DELETE /api/profile
+ * so the client doesn't keep sending a cookie pointing at a deleted row.
+ * SessionBootstrap on the next page load mints a fresh one.
+ */
+export function buildSessionClearCookie(): string {
+  return stringifySetCookie({
+    name: COOKIE_NAME,
+    value: "",
+    maxAge: 0,
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false,
+    path: "/",
+  });
+}
+
 // --- Student ensure --------------------------------------------------------
 
 export interface StudentRow {

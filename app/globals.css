@@ -77,3 +77,17 @@ body {
   background-color: color-mix(in oklab, var(--color-lamp) 40%, transparent);
   color: var(--color-ink);
 }
+
+/* Indeterminate progress bar used inside the running-indicator in
+   chat-message.tsx. A slider sweeps left → right, then right → left,
+   so the user always sees motion regardless of when the SDK sends its
+   next event. Pure CSS keeps this off the React render loop. */
+@keyframes chat-progress-sweep {
+  0%   { transform: translateX(-40%); width: 30%; }
+  50%  { transform: translateX(120%); width: 45%; }
+  100% { transform: translateX(-40%); width: 30%; }
+}
+.chat-progress-bar {
+  width: 30%;
+  animation: chat-progress-sweep 1.6s ease-in-out infinite;
+}

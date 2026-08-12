@@ -36,11 +36,8 @@ export function TopNav() {
           DropCheck
         </Link>
         <div className="ml-2 flex items-center gap-1 text-sm">
-          <NavLink href="/profile" pathname={pathname}>
-            Profile
-          </NavLink>
-          <NavLink href="/check" pathname={pathname}>
-            Check impact
+          <NavLink href="/chat" pathname={pathname}>
+            Chat
           </NavLink>
         </div>
       </nav>
