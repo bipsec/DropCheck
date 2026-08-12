@@ -1,4 +1,5 @@
 import { defineConfig } from "vitest/config";
+import react from "@vitejs/plugin-react";
 import path from "node:path";
 
 const here = import.meta.dirname;
@@ -12,6 +13,7 @@ const here = import.meta.dirname;
  *   the app code.
  */
 export default defineConfig({
+  plugins: [react()],
   resolve: {
     alias: {
       "@": path.resolve(here, "."),
@@ -19,7 +21,10 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["tests/**/*.test.ts"],
+    // React-render tests use jsdom via a `// @vitest-environment jsdom`
+    // docblock (see tests/trackViewRender.test.tsx). The rest of the
+    // suite runs on the node env.
+    include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
     globals: false,
     reporters: "default",
     coverage: {
