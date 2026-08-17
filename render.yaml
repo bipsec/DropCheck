@@ -1,0 +1,73 @@
+# Render Blueprint for @dropcheck/api. (apps/web deploys to Vercel and is
+# not part of this service — see the Dockerfile / .dockerignore.)
+#
+# Create the service once via Render → New → Blueprint → pick this repo.
+# Render reads this file, provisions the service, and prompts for the four
+# `sync: false` values below. After that, every push to the default branch
+# redeploys (autoDeploy).
+#
+# WHY A BLUEPRINT AND NOT THE DASHBOARD: the service *shape* (plan, region,
+# health check, which env vars exist) lives in git where it can be reviewed
+# and diffed, while the secret *values* only ever exist in Render. Nothing
+# here is sensitive.
+
+services:
+  - type: web
+    name: dropcheck-api
+    runtime: docker
+    # `standard` = 2 GB, and it is not a preference — it is measured.
+    #
+    # One real chat turn (7 SDK turns, 6 MCP tool calls) peaks at 546 MiB
+    # of cgroup memory: ~200 MiB of Node plus a ~309 MB native `claude`
+    # subprocess. Given a 512 MB limit the container pins to the ceiling
+    # and survives only by evicting page cache — meaning it re-reads that
+    # 309 MB binary from disk on every spawn. So `free` and `starter`
+    # (both 512 MB) are out; `standard` runs the same turn at ~27%.
+    #
+    # Re-measure before changing this:
+    #   docker run --memory 2g --env-file apps/api/.env.local dropcheck-api
+    #   docker exec <c> sh -c 'cat /sys/fs/cgroup/memory.peak'
+    plan: standard
+    region: oregon
+    # Build context is the repo root, not apps/api: this is an npm
+    # workspace, so the image needs packages/shared and the root lockfile.
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Cheap and dependency-free by design (see src/routes/health.ts).
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # The browser is on Vercel, this API is on onrender.com — different
+      # registrable domains, so the session cookie needs
+      # SameSite=None; Secure; Partitioned.
+      - key: COOKIE_CROSS_SITE
+        value: "true"
+      # Replaces Cloud Run's `--concurrency 2`, which Render has no
+      # equivalent for. Sized from the same measurement as `plan`: the
+      # process floor is ~200 MiB and each turn adds ~350 MiB, so two
+      # concurrent turns land near 900 MiB — comfortable in 2 GB, and
+      # over the line in 512 MB. Raise this only together with `plan`.
+      - key: MAX_CONCURRENT_TURNS
+        value: "2"
+      # Render generates this on first deploy and keeps it across
+      # redeploys, so the cookie-signing key never touches git or a shell
+      # history. Changing it in the dashboard invalidates every session.
+      - key: SESSION_SECRET
+        generateValue: true
+      # sync: false → Render prompts once at Blueprint creation and stores
+      # the value itself. Never commit any of these four.
+      - key: SUPABASE_URL
+        sync: false
+      # Exact browser origin(s) allowed to call this API with credentials,
+      # comma-separated (production + any Vercel preview URLs). Never a
+      # wildcard: browsers reject `Allow-Origin: *` alongside
+      # `Allow-Credentials: true`.
+      - key: WEB_ORIGIN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # The service_role key, not the anon key.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false

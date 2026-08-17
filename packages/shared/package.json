@@ -1,0 +1,18 @@
+{
+  "name": "@dropcheck/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Wire types shared by the API (SSE emitter) and the web app (SSE parser).",
+  "//": "Consumed as raw TypeScript source — no build step, so there is no dist/ to fall out of sync. The API runs through tsx and Next transpiles it via transpilePackages.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}

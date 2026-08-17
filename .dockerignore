@@ -1,0 +1,33 @@
+# The API image is built from the repo root (see apps/api/Dockerfile), so
+# this lives at the root. Keeping the context small matters here: the
+# image already carries a ~300 MB native binary.
+
+node_modules
+**/node_modules
+
+# The frontend is deployed to Vercel and has no business in this image.
+apps/web
+
+.next
+**/.next
+out
+dist
+build
+coverage
+*.tsbuildinfo
+
+.git
+.gitignore
+.github
+
+# Never bake secrets into a layer — they come from Secret Manager.
+.env
+.env.local
+**/.env.local
+**/.env.*.local
+
+apps/api/tests
+plan
+temp
+*.md
+!README.md

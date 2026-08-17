@@ -40,4 +40,10 @@ pnpm-debug.log*
 *.sw?
 plan/*
 AGENTS.md
-data/*
+temp/*
+
+# NOTE: `db/*` and `tests/*` used to be ignored here, which meant the SQL
+# migrations and the whole test suite were untracked. Both now live under
+# apps/api/ and are deliberately committed: a fresh Supabase project
+# cannot be provisioned without the migrations, and the tests are the
+# only verification story for the API/web split.
