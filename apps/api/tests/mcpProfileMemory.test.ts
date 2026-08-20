@@ -119,7 +119,11 @@ class FakeQuery {
     return out;
   }
 
-  private execute(): { data: Row[]; error: null } {
+  private execute(): { data: Row[] | null; error: { message: string } | null } {
+    // Injected per-table failure, so a test can assert the read path
+    // refuses to mistake a failed query for an empty table.
+    const failure = this.db.failures[this.table];
+    if (failure) return { data: null, error: { message: failure } };
     const store = this.db.tables[this.table] ?? [];
     if (!this.pending || this.pending.kind === "select") {
       const filtered = this.applyOrderLimit(this.applyFilters(store));
@@ -178,13 +182,20 @@ class FakeQuery {
     return { data: [], error: null };
   }
 
-  then<T>(onFulfilled: (v: { data: Row[]; error: null }) => T): Promise<T> {
+  then<T>(
+    onFulfilled: (v: {
+      data: Row[] | null;
+      error: { message: string } | null;
+    }) => T,
+  ): Promise<T> {
     return Promise.resolve(onFulfilled(this.execute()));
   }
 }
 
 class FakeDB {
   tables: Record<string, Row[]> = {};
+  /** table name → PostgREST-style error message to return instead of rows. */
+  failures: Record<string, string> = {};
   private nextIdCounter = 1;
 
   constructor(initial: Record<string, Row[]>) {
@@ -755,6 +766,103 @@ describe("profile-memory MCP tools", () => {
     const notes = await notesOf("stu-1");
     expect(notes.length).toBe(1);
     expect(notes[0].stance).toBe("exploring");
+  });
+
+  // --- Failed reads must not read as empty tables -----------------------
+  //
+  // Every one of these selects used to end in `?? []`, so a schema or RLS
+  // error surfaced as "this student has nothing" — no completed courses,
+  // no waivers, no notes — with no error anywhere. Silently stating
+  // something false is the failure class this whole pass exists to close,
+  // and a forgotten migration is the likeliest trigger.
+
+  it("test_failed_notes_read_names_phase5_migration", async () => {
+    seedOneStudent();
+    // Exactly what PostgREST returns when phase 5 was never applied.
+    fakeDb.failures.advising_notes =
+      'column advising_notes.stance does not exist';
+
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBe(true);
+    const p = structured<{ error: string; detail: string }>(res);
+    expect(p.error).toBe("migration_needed");
+    expect(p.detail).toMatch(/phase5_migration\.sql/);
+  });
+
+  it("test_failed_notes_read_names_base_schema_when_table_missing", async () => {
+    seedOneStudent();
+    fakeDb.failures.advising_notes =
+      "relation \"public.advising_notes\" does not exist";
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    const p = structured<{ error: string; detail: string }>(res);
+    expect(p.error).toBe("migration_needed");
+    // A missing table isn't a phase-5 problem — don't send them to the
+    // wrong file.
+    expect(p.detail).toMatch(/schema\.sql/);
+    expect(p.detail).not.toMatch(/phase5/);
+  });
+
+  it("test_failed_courses_read_does_not_report_zero_courses", async () => {
+    // The worst instance: the advisor would rebuild an entire degree plan
+    // from scratch for a student who has completed half of it.
+    seedOneStudent();
+    fakeDb.failures.courses_taken =
+      "column courses_taken.is_in_progress does not exist";
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBe(true);
+    const p = structured<{ error: string; detail: string }>(res);
+    expect(p.error).toBe("migration_needed");
+    expect(p.detail).toMatch(/courses_taken/);
+  });
+
+  it("test_failed_waivers_read_surfaces_error", async () => {
+    seedOneStudent();
+    fakeDb.failures.student_waivers = "permission denied for table student_waivers";
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBe(true);
+    // Not a schema shape, so it must NOT be mislabelled as a migration.
+    const p = structured<{ error: string; detail: string }>(res);
+    expect(p.error).not.toBe("migration_needed");
+    expect(p.detail).toMatch(/student_waivers/);
+  });
+
+  it("test_failed_transfers_read_surfaces_error", async () => {
+    seedOneStudent();
+    fakeDb.failures.student_transfers =
+      "column student_transfers.credits does not exist";
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBe(true);
+    expect(structured<{ error: string }>(res).error).toBe("migration_needed");
+  });
+
+  it("test_healthy_read_still_returns_empty_arrays_for_empty_tables", async () => {
+    // The guard must not turn a genuinely empty profile into an error —
+    // a brand-new student has no courses, waivers, or notes.
+    seedOneStudent();
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBeFalsy();
+    const p = structured<{
+      completed_courses: unknown[];
+      waivers: unknown[];
+      transfer_credits: unknown[];
+      recent_advising_notes: unknown[];
+    }>(res);
+    expect(p.completed_courses).toEqual([]);
+    expect(p.waivers).toEqual([]);
+    expect(p.transfer_credits).toEqual([]);
+    expect(p.recent_advising_notes).toEqual([]);
   });
 
   it("test_record_advising_note_rejects_empty_reasoning", async () => {

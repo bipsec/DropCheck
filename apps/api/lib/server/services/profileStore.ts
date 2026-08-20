@@ -48,6 +48,63 @@ function clientOrRaise(): SupabaseClient {
   return sb;
 }
 
+// --- Supabase select unwrapping -------------------------------------------
+//
+// `readProfile` fans five selects out in parallel, and four of them used
+// to end in `?? []`. That silently converts a failed query into an empty
+// table — "no completed courses", "no waivers", "no advising notes" — a
+// confident false statement, which is the exact failure class the
+// advising guardrails exist to prevent. Worse, it's invisible: the
+// advisor rebuilds a plan from scratch, or loses every note, with no
+// error anywhere. A forgotten migration is the likeliest cause, so the
+// error names the file that fixes it.
+//
+// Failing loudly costs less availability than it appears to. All five
+// queries share one client, so a genuine Supabase outage fails the
+// `students` lookup and throws before reaching here. One table failing
+// while the other four succeed is structural — a missing column or an
+// RLS policy — and it will not clear on its own.
+
+type SelectResult = {
+  data: unknown[] | null;
+  error: { message: string } | null;
+};
+
+function isSchemaError(message: string): boolean {
+  return /schema cache|does not exist|not found/i.test(message);
+}
+
+/**
+ * Which SQL file adds the advising-note fields this code selects. The
+ * columns arrived in phase 5 while the table itself predates it, so the
+ * hint has to distinguish them or it sends you to the wrong file.
+ */
+function advisingNotesMigration(message: string): string {
+  return /stance|retracted_at|retraction_reason/i.test(message)
+    ? "phase5_migration.sql"
+    : "schema.sql";
+}
+
+function rowsOrRaise(
+  result: SelectResult,
+  table: string,
+  migrationFile: string,
+): Array<Record<string, unknown>> {
+  const { data, error } = result;
+  if (error) {
+    if (isSchemaError(error.message)) {
+      throw new ProfileStoreError(
+        `${table} is missing expected columns (or the table itself). Apply ` +
+          `db/${migrationFile} via the Supabase SQL editor once, then retry. ` +
+          `Raw error: ${error.message}`,
+        "migration_needed",
+      );
+    }
+    throw new ProfileStoreError(`${table} lookup failed: ${error.message}`);
+  }
+  return (data ?? []) as Array<Record<string, unknown>>;
+}
+
 // --- Priority ranking (updated_plan.md §2.4) ------------------------------
 
 const SOURCE_RANK: Record<CompletedCourseSource, number> = {
@@ -106,7 +163,7 @@ export async function readProfile(studentId: string): Promise<StudentProfile> {
   }
   const s = studentRow.data[0] as Record<string, unknown>;
 
-  const coursesRaw = (coursesRow.data ?? []) as Array<Record<string, unknown>>;
+  const coursesRaw = rowsOrRaise(coursesRow, "courses_taken", "schema.sql");
   const completed: CompletedCourse[] = [];
   const inProgress: InProgressCourse[] = [];
   for (const row of coursesRaw) {
@@ -131,12 +188,14 @@ export async function readProfile(studentId: string): Promise<StudentProfile> {
     });
   }
 
-  const waivers = ((waiversRow.data ?? []) as Array<{ course_code: string }>).map(
-    (w) => normalizeCourse(w.course_code),
+  const waivers = rowsOrRaise(waiversRow, "student_waivers", "schema.sql").map(
+    (w) => normalizeCourse(String(w.course_code ?? "")),
   );
 
-  const transfers = (
-    (transfersRow.data ?? []) as Array<Record<string, unknown>>
+  const transfers = rowsOrRaise(
+    transfersRow,
+    "student_transfers",
+    "schema.sql",
   ).map<TransferCredit>((t) => ({
     external_course: String(t.external_course ?? ""),
     equivalent_course_code: normalizeCourse(
@@ -145,16 +204,18 @@ export async function readProfile(studentId: string): Promise<StudentProfile> {
     credits: Number(t.credits ?? 0),
   }));
 
-  const notes = ((notesRow.data ?? []) as Array<Record<string, unknown>>).map<AdvisingNote>(
-    (n) => ({
-      id: String(n.id ?? ""),
-      topic: String(n.topic ?? ""),
-      reasoning: String(n.reasoning ?? ""),
-      outcome: (n.outcome as string | null) ?? null,
-      stance: coalesceStance(n.stance),
-      created_at: String(n.created_at ?? ""),
-    }),
-  );
+  const notes = rowsOrRaise(
+    notesRow,
+    "advising_notes",
+    advisingNotesMigration(notesRow.error?.message ?? ""),
+  ).map<AdvisingNote>((n) => ({
+    id: String(n.id ?? ""),
+    topic: String(n.topic ?? ""),
+    reasoning: String(n.reasoning ?? ""),
+    outcome: (n.outcome as string | null) ?? null,
+    stance: coalesceStance(n.stance),
+    created_at: String(n.created_at ?? ""),
+  }));
 
   return {
     student_id: String(s.id),
