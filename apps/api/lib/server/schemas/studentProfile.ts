@@ -20,11 +20,23 @@ const strict = <T extends z.ZodRawShape>(shape: T) => z.strictObject(shape);
 const trim = z.string().trim();
 const courseCode = trim.min(1).max(32).transform(normalizeCourse);
 
+/**
+ * How committed the student actually was when this note was written.
+ *
+ * This exists because "I want to drop CS 25000, give me replacement
+ * options" is exploratory phrasing that reads as a decision. Without a
+ * declared stance the advisor recorded it as one, and the student had no
+ * way to tell that had happened. Now the distinction is data, not tone.
+ */
+export const AdvisingNoteStance = z.enum(["exploring", "advised", "decided"]);
+export type AdvisingNoteStance = z.infer<typeof AdvisingNoteStance>;
+
 export const AdvisingNote = strict({
   id: trim.min(1),
   topic: trim.min(1).max(120),
   reasoning: trim.min(1),
   outcome: trim.nullable().optional(),
+  stance: AdvisingNoteStance.default("exploring"),
   created_at: trim,
 });
 export type AdvisingNote = z.infer<typeof AdvisingNote>;
@@ -73,9 +85,19 @@ export const StudentPatch = strict({
 });
 export type StudentPatch = z.infer<typeof StudentPatch>;
 
+// `outcome` is the field that records "the student decided X", so it is
+// only legal alongside `stance: "decided"`. Rejecting the combination
+// here — rather than trusting the system prompt to describe it — is what
+// makes a false decision record impossible instead of merely discouraged.
 export const AdvisingNoteInput = strict({
   topic: trim.min(1).max(120),
   reasoning: trim.min(1).max(4000),
   outcome: trim.max(2000).nullable().optional(),
+  stance: AdvisingNoteStance.default("exploring"),
+}).refine((n) => n.stance === "decided" || n.outcome == null, {
+  path: ["outcome"],
+  message:
+    'outcome requires stance: "decided" — only set it when the student ' +
+    "explicitly committed in-turn. Exploring an option is not a decision.",
 });
 export type AdvisingNoteInput = z.infer<typeof AdvisingNoteInput>;

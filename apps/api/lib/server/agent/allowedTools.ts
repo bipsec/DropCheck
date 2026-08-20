@@ -19,6 +19,7 @@ export const ALLOWED_TOOLS: readonly string[] = [
   "mcp__profile-memory__get_student_profile",
   "mcp__profile-memory__update_student_profile",
   "mcp__profile-memory__record_advising_note",
+  "mcp__profile-memory__retract_advising_note",
 
   // University catalog (Purdue.io)
   "mcp__university-catalog__get_course",

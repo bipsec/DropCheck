@@ -24,6 +24,15 @@ export interface CoursePayload {
   warning?: string;
 }
 
+// `low_unstructured_hint` → "low confidence". Read from the payload
+// rather than hardcoded, so the badge stops claiming low confidence the
+// day a structured prereq source appears.
+function confidenceLabel(raw: string | undefined): string {
+  if (!raw) return "confidence unknown";
+  if (raw === "low_unstructured_hint") return "low confidence";
+  return raw.replace(/_/g, " ");
+}
+
 export function CourseCard({ payload }: { payload: CoursePayload }) {
   const hasHints =
     (payload.prerequisites_hint?.length ?? 0) > 0;
@@ -67,7 +76,7 @@ export function CourseCard({ payload }: { payload: CoursePayload }) {
           <div className="rounded-md border border-[color:var(--color-verdict-watch)]/30 bg-[color:var(--color-verdict-watch)]/5 px-3 py-2">
             <div className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-[color:var(--color-verdict-watch)]">
               <AlertTriangle className="size-3" />
-              Prereq hint · low confidence
+              Prereq hint · {confidenceLabel(payload.prerequisites_confidence)}
             </div>
             <p className="mt-1 font-mono text-[11px] text-foreground/85">
               {payload.prerequisites_hint!.join(", ")}

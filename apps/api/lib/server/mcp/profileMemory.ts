@@ -14,12 +14,14 @@ import { z } from "zod";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import {
   AdvisingNoteInput,
+  AdvisingNoteStance,
   StudentPatch,
 } from "@/lib/server/schemas/studentProfile";
 import {
   applyPatch,
   ProfileStoreError,
   readProfile,
+  retractAdvisingNote,
   writeAdvisingNote,
 } from "@/lib/server/services/profileStore";
 
@@ -149,12 +151,22 @@ const noteSchema = {
       "The advisor's reasoning — what constraints, tools, and student " +
         "priorities went into the recommendation.",
     ),
+  stance: AdvisingNoteStance.default("exploring").describe(
+    "How committed the student actually is. " +
+      '"exploring" — they are weighing an option ("I want to…", ' +
+      '"should I…", "thinking about…"); this is the default and the right ' +
+      'answer whenever you are unsure. "advised" — you gave a ' +
+      'recommendation but no decision was reached. "decided" — the ' +
+      "student explicitly committed IN THIS TURN. Asking about a course " +
+      "or requesting options is never a decision.",
+  ),
   outcome: z
     .string()
     .nullable()
     .optional()
     .describe(
-      "Optional — what the student decided (if a decision was reached in-turn).",
+      "What the student decided. REJECTED unless stance is \"decided\" — " +
+        "leave it unset for exploratory or advisory notes.",
     ),
 };
 
@@ -162,7 +174,9 @@ const recordAdvisingNote = tool(
   "record_advising_note",
   "Write one advising note for this student. Notes surface in future " +
     "`get_student_profile` calls (newest first, capped at 8) so the " +
-    "advisor can pick up threads across sessions.",
+    "advisor can pick up threads across sessions. Set `stance` honestly: " +
+    "a note recorded as a decision the student never made will steer " +
+    "every later session until it is retracted.",
   noteSchema,
   async (args) => {
     let payload;
@@ -171,6 +185,7 @@ const recordAdvisingNote = tool(
         topic: args.topic,
         reasoning: args.reasoning,
         outcome: args.outcome ?? null,
+        stance: args.stance,
       });
     } catch (err) {
       return fail(
@@ -187,12 +202,55 @@ const recordAdvisingNote = tool(
   },
 );
 
+// --- retract_advising_note ------------------------------------------------
+
+const retractNoteSchema = {
+  student_id: z.string(),
+  note_id: z
+    .string()
+    .describe(
+      "The note's `id`, taken from get_student_profile's " +
+        "`recent_advising_notes[].id`. Never invent one — call " +
+        "get_student_profile first and read the id off the note you mean.",
+    ),
+  reason: z
+    .string()
+    .describe(
+      "Why the note is being withdrawn, in the student's terms " +
+        "(e.g. 'student was exploring, not deciding').",
+    ),
+};
+
+const retractAdvisingNoteTool = tool(
+  "retract_advising_note",
+  "Withdraw an advising note that recorded something inaccurately. The " +
+    "note stops appearing in get_student_profile immediately. Use this " +
+    "when the student says a note is wrong — do NOT write a second note " +
+    "correcting the first, which would leave both in circulation. " +
+    "Returns { error: 'not_found' } if the id isn't a live note for this " +
+    "student.",
+  retractNoteSchema,
+  async (args) => {
+    try {
+      const note = await retractAdvisingNote(
+        args.student_id,
+        args.note_id,
+        args.reason,
+      );
+      return ok({ retracted: true, note: note as unknown as Record<string, unknown> });
+    } catch (err) {
+      return errorToResult(err);
+    }
+  },
+);
+
 // --- Server assembly ------------------------------------------------------
 
 export const profileMemoryTools = [
   getStudentProfile,
   updateStudentProfile,
   recordAdvisingNote,
+  retractAdvisingNoteTool,
 ];
 
 export const profileMemoryServer = createSdkMcpServer({
@@ -204,8 +262,10 @@ export const profileMemoryServer = createSdkMcpServer({
     "Call update_student_profile whenever the student reveals new " +
     "facts (major, taken courses, target grad term, etc.). Call " +
     "record_advising_note after giving substantive advice so future " +
-    "sessions can build on it. All tools return { error, detail } on " +
-    "failure — never throw.",
+    "sessions can build on it, with a `stance` that matches what the " +
+    "student actually committed to. Call retract_advising_note when a " +
+    "note turns out to be wrong — never paper over it with a second " +
+    "note. All tools return { error, detail } on failure — never throw.",
   tools: profileMemoryTools,
 });
 

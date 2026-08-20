@@ -10,8 +10,14 @@ import {
   DropImpactView,
   type DropImpactPayload,
 } from "@/components/drop-impact-view";
-import { TrackRoadway } from "@/components/track-roadway";
-import type { Track } from "@dropcheck/shared";
+import {
+  PrereqCheckCard,
+  type PrereqCheckPayload,
+} from "@/components/prereq-check-card";
+import {
+  TrackRoadway,
+  type TrackPayload,
+} from "@/components/track-roadway";
 
 /**
  * Registry mapping SDK-normalized tool names to inline renderers.
@@ -27,7 +33,10 @@ type Renderer = (payload: unknown) => React.ReactNode;
 
 const REGISTRY: Record<string, Renderer> = {
   "mcp__rules-engine__build_track": (payload) => (
-    <TrackRoadway track={payload as Track} />
+    <TrackRoadway track={payload as TrackPayload} />
+  ),
+  "mcp__rules-engine__check_prerequisites": (payload) => (
+    <PrereqCheckCard payload={payload as PrereqCheckPayload} />
   ),
   "mcp__rules-engine__impact_of_dropping": (payload) => (
     <DropImpactView payload={payload as DropImpactPayload} />
