@@ -16,6 +16,7 @@ class FakeQuery {
   private db: FakeDB;
   private filters: Array<[string, unknown]> = [];
   private inFilters: Array<[string, unknown[]]> = [];
+  private isFilters: Array<[string, unknown]> = [];
   private orderKey: string | null = null;
   private orderDesc = false;
   private limitN: number | null = null;
@@ -53,6 +54,14 @@ class FakeQuery {
     this.inFilters.push([field, values]);
     return this;
   }
+  // `.is(col, null)` is SQL `col IS NULL`. Seeded rows that predate the
+  // phase-5 migration simply lack the column, so `undefined` has to
+  // count as null here — otherwise every pre-migration fixture row would
+  // be filtered out of `readProfile`.
+  is(field: string, value: unknown) {
+    this.isFilters.push([field, value]);
+    return this;
+  }
   order(key: string, opts?: { ascending?: boolean }) {
     this.orderKey = key;
     this.orderDesc = opts?.ascending === false;
@@ -79,14 +88,21 @@ class FakeQuery {
     return this;
   }
 
+  private matches(r: Row): boolean {
+    for (const [k, v] of this.filters) if (r[k] !== v) return false;
+    for (const [k, vs] of this.inFilters) {
+      if (!vs.includes(r[k])) return false;
+    }
+    for (const [k, v] of this.isFilters) {
+      if (v === null) {
+        if (r[k] != null) return false;
+      } else if (r[k] !== v) return false;
+    }
+    return true;
+  }
+
   private applyFilters(rows: Row[]): Row[] {
-    return rows.filter((r) => {
-      for (const [k, v] of this.filters) if (r[k] !== v) return false;
-      for (const [k, vs] of this.inFilters) {
-        if (!vs.includes(r[k])) return false;
-      }
-      return true;
-    });
+    return rows.filter((r) => this.matches(r));
   }
 
   private applyOrderLimit(rows: Row[]): Row[] {
@@ -103,7 +119,11 @@ class FakeQuery {
     return out;
   }
 
-  private execute(): { data: Row[]; error: null } {
+  private execute(): { data: Row[] | null; error: { message: string } | null } {
+    // Injected per-table failure, so a test can assert the read path
+    // refuses to mistake a failed query for an empty table.
+    const failure = this.db.failures[this.table];
+    if (failure) return { data: null, error: { message: failure } };
     const store = this.db.tables[this.table] ?? [];
     if (!this.pending || this.pending.kind === "select") {
       const filtered = this.applyOrderLimit(this.applyFilters(store));
@@ -139,12 +159,19 @@ class FakeQuery {
     }
     if (this.pending.kind === "update") {
       const fields = this.pending.fields;
+      // Postgres evaluates the WHERE against the pre-update row and
+      // returns the post-update row. Matching after the write would miss
+      // any update whose own fields break its predicate — exactly what
+      // `set retracted_at = now() where retracted_at is null` does.
+      const updated: Row[] = [];
       const next = store.map((r) => {
-        for (const [k, v] of this.filters) if (r[k] !== v) return r;
-        return { ...r, ...fields };
+        if (!this.matches(r)) return r;
+        const merged = { ...r, ...fields };
+        updated.push(merged);
+        return merged;
       });
       this.db.tables[this.table] = next;
-      return { data: next.filter((r) => this.filters.every(([k, v]) => r[k] === v)), error: null };
+      return { data: updated, error: null };
     }
     if (this.pending.kind === "delete") {
       const filtered = this.applyFilters(store);
@@ -155,13 +182,20 @@ class FakeQuery {
     return { data: [], error: null };
   }
 
-  then<T>(onFulfilled: (v: { data: Row[]; error: null }) => T): Promise<T> {
+  then<T>(
+    onFulfilled: (v: {
+      data: Row[] | null;
+      error: { message: string } | null;
+    }) => T,
+  ): Promise<T> {
     return Promise.resolve(onFulfilled(this.execute()));
   }
 }
 
 class FakeDB {
   tables: Record<string, Row[]> = {};
+  /** table name → PostgREST-style error message to return instead of rows. */
+  failures: Record<string, string> = {};
   private nextIdCounter = 1;
 
   constructor(initial: Record<string, Row[]>) {
@@ -489,6 +523,9 @@ describe("profile-memory MCP tools", () => {
       student_id: "stu-1",
       topic: "CS 301 timing",
       reasoning: "Fall-only; front-load MATH 210.",
+      // `outcome` now requires an explicit commitment — the student
+      // agreeing IS the decision, so the stance has to say so.
+      stance: "decided",
       outcome: "student agreed",
     });
     expect(writeRes.isError).toBeFalsy();
@@ -515,6 +552,317 @@ describe("profile-memory MCP tools", () => {
     expect(res.isError).toBe(true);
     const p = structured<{ error: string }>(res);
     expect(p.error).toBe("invalid_patch");
+  });
+
+  // --- Note stance & retraction -----------------------------------------
+  //
+  // Live testing: "I want to drop CS 25000, give me replacement options"
+  // came back as "Noted — I've recorded the drop decision," and the note
+  // then couldn't be withdrawn. `stance` makes recording a decision
+  // require declaring one; retraction makes a wrong record removable.
+
+  function seedOneStudent() {
+    seed({
+      students: [
+        {
+          id: "stu-1",
+          program_id: "cs_bs",
+          entry_type: "manual",
+          max_credits_per_term: 15,
+        },
+      ],
+    });
+  }
+
+  async function notesOf(studentId: string) {
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: studentId,
+    });
+    return structured<{
+      recent_advising_notes: Array<{
+        id: string;
+        topic: string;
+        stance: string;
+        outcome: string | null;
+      }>;
+    }>(res).recent_advising_notes;
+  }
+
+  it("test_record_advising_note_defaults_stance_to_exploring", async () => {
+    seedOneStudent();
+    const res = await invokeProfileMemoryTool("record_advising_note", {
+      student_id: "stu-1",
+      topic: "CS 25000 drop options",
+      reasoning: "Student asked for replacements; nothing committed.",
+    });
+    expect(res.isError).toBeFalsy();
+    // Under-claiming the student's commitment is the safe direction.
+    expect(structured<{ stance: string }>(res).stance).toBe("exploring");
+    const notes = await notesOf("stu-1");
+    expect(notes[0].stance).toBe("exploring");
+    expect(notes[0].outcome).toBeNull();
+  });
+
+  it("test_record_advising_note_rejects_outcome_without_decided_stance", async () => {
+    seedOneStudent();
+    for (const stance of [undefined, "exploring", "advised"]) {
+      const res = await invokeProfileMemoryTool("record_advising_note", {
+        student_id: "stu-1",
+        topic: "CS 25000 drop",
+        reasoning: "Student was weighing options.",
+        ...(stance ? { stance } : {}),
+        outcome: "dropped CS 25000",
+      });
+      expect(res.isError).toBe(true);
+      expect(structured<{ error: string }>(res).error).toBe("invalid_note");
+    }
+    // Nothing was persisted by any of the rejected attempts.
+    expect(await notesOf("stu-1")).toEqual([]);
+  });
+
+  it("test_record_advising_note_accepts_outcome_when_decided", async () => {
+    seedOneStudent();
+    const res = await invokeProfileMemoryTool("record_advising_note", {
+      student_id: "stu-1",
+      topic: "CS 25000 drop",
+      reasoning: "Student confirmed the drop this turn.",
+      stance: "decided",
+      outcome: "dropped CS 25000",
+    });
+    expect(res.isError).toBeFalsy();
+    const notes = await notesOf("stu-1");
+    expect(notes[0].stance).toBe("decided");
+    expect(notes[0].outcome).toBe("dropped CS 25000");
+  });
+
+  it("test_record_advising_note_rejects_unknown_stance", async () => {
+    seedOneStudent();
+    const res = await invokeProfileMemoryTool("record_advising_note", {
+      student_id: "stu-1",
+      topic: "topic",
+      reasoning: "reasoning",
+      stance: "committed", // not one of the three
+    });
+    expect(res.isError).toBe(true);
+    expect(structured<{ error: string }>(res).error).toBe("invalid_note");
+  });
+
+  it("test_retract_advising_note_removes_it_from_next_get", async () => {
+    seedOneStudent();
+    const write = await invokeProfileMemoryTool("record_advising_note", {
+      student_id: "stu-1",
+      topic: "CS 25000 drop decision",
+      reasoning: "Recorded in error — the student was exploring.",
+    });
+    const noteId = structured<{ id: string }>(write).id;
+    expect(noteId).toBeTruthy();
+    expect((await notesOf("stu-1")).length).toBe(1);
+
+    const res = await invokeProfileMemoryTool("retract_advising_note", {
+      student_id: "stu-1",
+      note_id: noteId,
+      reason: "student was exploring, not deciding",
+    });
+    expect(res.isError).toBeFalsy();
+    expect(structured<{ retracted: boolean }>(res).retracted).toBe(true);
+
+    // Gone from the profile the next turn reads...
+    expect(await notesOf("stu-1")).toEqual([]);
+    // ...but still on the table: soft delete keeps the advising trail.
+    const row = fakeDb.tables.advising_notes.find((r) => r.id === noteId)!;
+    expect(row).toBeDefined();
+    expect(row.retracted_at).toBeTruthy();
+    expect(row.retraction_reason).toBe("student was exploring, not deciding");
+  });
+
+  it("test_retract_advising_note_returns_not_found_for_unknown_id", async () => {
+    seedOneStudent();
+    const res = await invokeProfileMemoryTool("retract_advising_note", {
+      student_id: "stu-1",
+      note_id: "note-that-never-existed",
+      reason: "wrong",
+    });
+    expect(res.isError).toBe(true);
+    expect(structured<{ error: string }>(res).error).toBe("not_found");
+  });
+
+  it("test_retract_advising_note_cannot_reach_another_students_note", async () => {
+    // `note_id` arrives from an LLM tool call, so the student_id predicate
+    // is the authorization boundary — not a convenience filter.
+    seed({
+      students: [
+        { id: "stu-1", program_id: "cs_bs", entry_type: "manual" },
+        { id: "stu-2", program_id: "cs_bs", entry_type: "manual" },
+      ],
+      advising_notes: [
+        {
+          id: "note-owned-by-2",
+          student_id: "stu-2",
+          topic: "someone else's note",
+          reasoning: "not stu-1's business",
+          outcome: null,
+          stance: "exploring",
+          created_at: "2026-08-01T00:00:00Z",
+        },
+      ],
+    });
+
+    const res = await invokeProfileMemoryTool("retract_advising_note", {
+      student_id: "stu-1",
+      note_id: "note-owned-by-2",
+      reason: "trying to reach across students",
+    });
+    expect(res.isError).toBe(true);
+    expect(structured<{ error: string }>(res).error).toBe("not_found");
+    // stu-2's note is untouched and still live.
+    const row = fakeDb.tables.advising_notes[0];
+    expect(row.retracted_at == null).toBe(true);
+    expect((await notesOf("stu-2")).length).toBe(1);
+  });
+
+  it("test_retract_advising_note_is_not_repeatable", async () => {
+    // Retracting twice must not report a second success — the `is null`
+    // guard is what makes the operation idempotent-but-honest.
+    seedOneStudent();
+    const write = await invokeProfileMemoryTool("record_advising_note", {
+      student_id: "stu-1",
+      topic: "note",
+      reasoning: "reasoning",
+    });
+    const noteId = structured<{ id: string }>(write).id;
+    const first = await invokeProfileMemoryTool("retract_advising_note", {
+      student_id: "stu-1",
+      note_id: noteId,
+      reason: "first",
+    });
+    expect(first.isError).toBeFalsy();
+    const second = await invokeProfileMemoryTool("retract_advising_note", {
+      student_id: "stu-1",
+      note_id: noteId,
+      reason: "second",
+    });
+    expect(second.isError).toBe(true);
+    expect(structured<{ error: string }>(second).error).toBe("not_found");
+    // The first reason stands — a repeat attempt can't rewrite the record.
+    const row = fakeDb.tables.advising_notes.find((r) => r.id === noteId)!;
+    expect(row.retraction_reason).toBe("first");
+  });
+
+  it("test_read_profile_coalesces_missing_stance_on_legacy_rows", async () => {
+    // Rows written before phase 5 have no `stance` column value at all.
+    seed({
+      students: [{ id: "stu-1", program_id: "cs_bs", entry_type: "manual" }],
+      advising_notes: [
+        {
+          id: "legacy-note",
+          student_id: "stu-1",
+          topic: "pre-migration note",
+          reasoning: "written before stance existed",
+          outcome: null,
+          created_at: "2026-07-01T00:00:00Z",
+        },
+      ],
+    });
+    const notes = await notesOf("stu-1");
+    expect(notes.length).toBe(1);
+    expect(notes[0].stance).toBe("exploring");
+  });
+
+  // --- Failed reads must not read as empty tables -----------------------
+  //
+  // Every one of these selects used to end in `?? []`, so a schema or RLS
+  // error surfaced as "this student has nothing" — no completed courses,
+  // no waivers, no notes — with no error anywhere. Silently stating
+  // something false is the failure class this whole pass exists to close,
+  // and a forgotten migration is the likeliest trigger.
+
+  it("test_failed_notes_read_names_phase5_migration", async () => {
+    seedOneStudent();
+    // Exactly what PostgREST returns when phase 5 was never applied.
+    fakeDb.failures.advising_notes =
+      'column advising_notes.stance does not exist';
+
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBe(true);
+    const p = structured<{ error: string; detail: string }>(res);
+    expect(p.error).toBe("migration_needed");
+    expect(p.detail).toMatch(/phase5_migration\.sql/);
+  });
+
+  it("test_failed_notes_read_names_base_schema_when_table_missing", async () => {
+    seedOneStudent();
+    fakeDb.failures.advising_notes =
+      "relation \"public.advising_notes\" does not exist";
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    const p = structured<{ error: string; detail: string }>(res);
+    expect(p.error).toBe("migration_needed");
+    // A missing table isn't a phase-5 problem — don't send them to the
+    // wrong file.
+    expect(p.detail).toMatch(/schema\.sql/);
+    expect(p.detail).not.toMatch(/phase5/);
+  });
+
+  it("test_failed_courses_read_does_not_report_zero_courses", async () => {
+    // The worst instance: the advisor would rebuild an entire degree plan
+    // from scratch for a student who has completed half of it.
+    seedOneStudent();
+    fakeDb.failures.courses_taken =
+      "column courses_taken.is_in_progress does not exist";
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBe(true);
+    const p = structured<{ error: string; detail: string }>(res);
+    expect(p.error).toBe("migration_needed");
+    expect(p.detail).toMatch(/courses_taken/);
+  });
+
+  it("test_failed_waivers_read_surfaces_error", async () => {
+    seedOneStudent();
+    fakeDb.failures.student_waivers = "permission denied for table student_waivers";
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBe(true);
+    // Not a schema shape, so it must NOT be mislabelled as a migration.
+    const p = structured<{ error: string; detail: string }>(res);
+    expect(p.error).not.toBe("migration_needed");
+    expect(p.detail).toMatch(/student_waivers/);
+  });
+
+  it("test_failed_transfers_read_surfaces_error", async () => {
+    seedOneStudent();
+    fakeDb.failures.student_transfers =
+      "column student_transfers.credits does not exist";
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBe(true);
+    expect(structured<{ error: string }>(res).error).toBe("migration_needed");
+  });
+
+  it("test_healthy_read_still_returns_empty_arrays_for_empty_tables", async () => {
+    // The guard must not turn a genuinely empty profile into an error —
+    // a brand-new student has no courses, waivers, or notes.
+    seedOneStudent();
+    const res = await invokeProfileMemoryTool("get_student_profile", {
+      student_id: "stu-1",
+    });
+    expect(res.isError).toBeFalsy();
+    const p = structured<{
+      completed_courses: unknown[];
+      waivers: unknown[];
+      transfer_credits: unknown[];
+      recent_advising_notes: unknown[];
+    }>(res);
+    expect(p.completed_courses).toEqual([]);
+    expect(p.waivers).toEqual([]);
+    expect(p.transfer_credits).toEqual([]);
+    expect(p.recent_advising_notes).toEqual([]);
   });
 
   it("test_record_advising_note_rejects_empty_reasoning", async () => {

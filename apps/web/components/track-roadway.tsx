@@ -2,6 +2,10 @@
 
 import * as React from "react";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  GenericCodesBanner,
+  type CodeNamespaceFields,
+} from "@/components/generic-codes-banner";
 import { TrackLegend } from "@/components/track-legend";
 import type { Track } from "@dropcheck/shared";
 import { cn } from "@/lib/utils";
@@ -20,8 +24,16 @@ import { cn } from "@/lib/utils";
  * `Track` shape comes directly from the deterministic scheduler.
  */
 
+/**
+ * `build_track` spreads the deterministic `Track` and then stamps the
+ * namespace fields alongside it — `Track` itself is a strict schema built
+ * by the scheduler, so the disclosure rides on the wire rather than in
+ * the shape. Hence the intersection instead of a widened `Track`.
+ */
+export type TrackPayload = Track & CodeNamespaceFields;
+
 type Props = {
-  track: Track;
+  track: TrackPayload;
   /** Course codes the student already has credit for. */
   completedCodes?: Set<string>;
 };
@@ -52,6 +64,9 @@ export function TrackRoadway({ track, completedCodes }: Props) {
   return (
     <Card>
       <CardContent className="p-5">
+        {/* Above the plan, deliberately — disclosing after it is the
+            specific failure this fixes. */}
+        <GenericCodesBanner payload={track} />
         <div className="mb-3 flex flex-wrap items-baseline justify-between gap-3">
           <div>
             <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground">

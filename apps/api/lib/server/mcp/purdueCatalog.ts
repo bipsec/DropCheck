@@ -13,6 +13,7 @@ import { z } from "zod";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { normalizeCourse } from "@/lib/server/data/catalog";
 import {
+  codeNamespaceOf,
   getProgram,
   UnknownProgramError,
 } from "@/lib/server/data/programs";
@@ -201,7 +202,11 @@ const getProgramReqTool = tool(
   async (args) => {
     try {
       const program = getProgram(args.program_id);
-      return ok({ program, source: "archetype" });
+      return ok({
+        program,
+        source: "archetype",
+        ...codeNamespaceOf(program),
+      });
     } catch (err) {
       if (err instanceof UnknownProgramError) {
         return fail(

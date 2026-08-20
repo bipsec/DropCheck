@@ -65,6 +65,35 @@ export function programIdForMajor(
   return null;
 }
 
+// --- Code namespace -------------------------------------------------------
+//
+// Every fixture above is `institution_id: "generic"` and uses invented
+// codes (CS 101, MATH 210, PSY 101). The real catalog served by
+// get_course uses Purdue's actual codes (CS 18000, MA 26100). Those two
+// namespaces are indistinguishable by shape, which is how a plan built
+// from a fixture got presented as a Purdue plan and only disclosed as
+// generic afterwards.
+//
+// So any tool that emits fixture-derived course codes stamps the payload
+// with its namespace. The advisor is told to lead with `advisory`, and the
+// frontend renders it as a banner regardless — a plan can't reach the
+// student unlabelled.
+
+export const GENERIC_CODE_ADVISORY =
+  "These are generic archetype course codes, not real institution course " +
+  "codes — the student cannot register from them. Use this plan for shape " +
+  "and sequencing only, and say so BEFORE presenting it, not after.";
+
+export function codeNamespaceOf(
+  program: Pick<ProgramRequirements, "institution_id">,
+): Record<string, unknown> {
+  const generic = program.institution_id === "generic";
+  return {
+    code_namespace: generic ? "generic" : "institution",
+    ...(generic ? { advisory: GENERIC_CODE_ADVISORY } : {}),
+  };
+}
+
 export function getProgram(programId: string): ProgramRequirements {
   const row = PROGRAMS[programId];
   if (!row) throw new UnknownProgramError(programId);

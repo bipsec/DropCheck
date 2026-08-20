@@ -130,8 +130,64 @@ describe("buildAgentOptions", () => {
     for (const t of ALLOWED_TOOLS) {
       expect(opts.allowedTools).toContain(t);
     }
-    // 4 rules + 3 profile + 4 catalog = 11 tools.
-    expect(opts.allowedTools!.length).toBe(11);
+    // 4 rules + 4 profile + 4 catalog = 12 tools.
+    expect(opts.allowedTools!.length).toBe(12);
+    // The retraction tool is invisible to the agent unless it's here —
+    // the SDK denies anything absent from this list.
+    expect(opts.allowedTools).toContain(
+      "mcp__profile-memory__retract_advising_note",
+    );
+  });
+
+  // The four integrity guardrails found in live testing. Each is enforced
+  // in a schema or in the UI too — these assert the prompt hasn't drifted
+  // out of agreement with that enforcement, which is how the model ends up
+  // announcing a policy the code doesn't implement (or vice versa).
+  it("test_prompt_states_stance_discipline_for_notes", () => {
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/stance/);
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/"exploring"/);
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/"advised"/);
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/"decided"/);
+    // The specific misread from live testing: asking about a drop is not
+    // dropping. The prompt is hard-wrapped, so match across line breaks.
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(
+      /Asking\s+about\s+a\s+drop\s+is\s+not\s+dropping/,
+    );
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(
+      /Never\s+report\s+a\s+decision\s+when\s+you\s+recorded\s+exploration/,
+    );
+  });
+
+  it("test_prompt_makes_confidence_sticky", () => {
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/CONFIDENCE IS STICKY/);
+    // "verified" / "confirmed" are reserved for the two trustworthy
+    // provenances, not available for catalog prose.
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/student_asserted/);
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/archetype/);
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(
+      /never describe a tool result as verification of data you fed/,
+    );
+  });
+
+  it("test_prompt_requires_leading_with_generic_code_advisory", () => {
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/code_namespace/);
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/advisory/);
+    // Order is the whole point — disclosing afterwards is the bug.
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/BEFORE presenting the plan/);
+  });
+
+  it("test_prompt_directs_retraction_instead_of_correction_notes", () => {
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/retract_advising_note/);
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(
+      /Do\s+NOT\s+write\s+a\s+second\s+note\s+correcting\s+the\s+first/,
+    );
+  });
+
+  it("test_prompt_tool_count_matches_allowed_tools", () => {
+    // A stale count tells the model tools exist that don't, or hides ones
+    // that do. Twelve is the number asserted above.
+    expect(ADVISOR_SYSTEM_PROMPT).toMatch(/twelve MCP tools/);
+    expect(ALLOWED_TOOLS.length).toBe(12);
   });
 
   it("test_agent_options_include_advisor_system_prompt", async () => {

@@ -21,6 +21,7 @@ import type {
 import type {
   AdvisingNote,
   AdvisingNoteInput,
+  AdvisingNoteStance,
   StudentPatch,
   StudentProfile,
 } from "@/lib/server/schemas/studentProfile";
@@ -45,6 +46,63 @@ function clientOrRaise(): SupabaseClient {
     );
   }
   return sb;
+}
+
+// --- Supabase select unwrapping -------------------------------------------
+//
+// `readProfile` fans five selects out in parallel, and four of them used
+// to end in `?? []`. That silently converts a failed query into an empty
+// table — "no completed courses", "no waivers", "no advising notes" — a
+// confident false statement, which is the exact failure class the
+// advising guardrails exist to prevent. Worse, it's invisible: the
+// advisor rebuilds a plan from scratch, or loses every note, with no
+// error anywhere. A forgotten migration is the likeliest cause, so the
+// error names the file that fixes it.
+//
+// Failing loudly costs less availability than it appears to. All five
+// queries share one client, so a genuine Supabase outage fails the
+// `students` lookup and throws before reaching here. One table failing
+// while the other four succeed is structural — a missing column or an
+// RLS policy — and it will not clear on its own.
+
+type SelectResult = {
+  data: unknown[] | null;
+  error: { message: string } | null;
+};
+
+function isSchemaError(message: string): boolean {
+  return /schema cache|does not exist|not found/i.test(message);
+}
+
+/**
+ * Which SQL file adds the advising-note fields this code selects. The
+ * columns arrived in phase 5 while the table itself predates it, so the
+ * hint has to distinguish them or it sends you to the wrong file.
+ */
+function advisingNotesMigration(message: string): string {
+  return /stance|retracted_at|retraction_reason/i.test(message)
+    ? "phase5_migration.sql"
+    : "schema.sql";
+}
+
+function rowsOrRaise(
+  result: SelectResult,
+  table: string,
+  migrationFile: string,
+): Array<Record<string, unknown>> {
+  const { data, error } = result;
+  if (error) {
+    if (isSchemaError(error.message)) {
+      throw new ProfileStoreError(
+        `${table} is missing expected columns (or the table itself). Apply ` +
+          `db/${migrationFile} via the Supabase SQL editor once, then retry. ` +
+          `Raw error: ${error.message}`,
+        "migration_needed",
+      );
+    }
+    throw new ProfileStoreError(`${table} lookup failed: ${error.message}`);
+  }
+  return (data ?? []) as Array<Record<string, unknown>>;
 }
 
 // --- Priority ranking (updated_plan.md §2.4) ------------------------------
@@ -82,8 +140,12 @@ export async function readProfile(studentId: string): Promise<StudentProfile> {
         .eq("student_id", studentId),
       sb
         .from("advising_notes")
-        .select("id, topic, reasoning, outcome, created_at")
+        .select("id, topic, reasoning, outcome, stance, created_at")
         .eq("student_id", studentId)
+        // Retracted notes are soft-deleted: the row stays for the audit
+        // trail but must never resurface as advisor context, or a note
+        // the student already corrected keeps steering future turns.
+        .is("retracted_at", null)
         .order("created_at", { ascending: false })
         .limit(RECENT_NOTE_LIMIT),
     ]);
@@ -101,7 +163,7 @@ export async function readProfile(studentId: string): Promise<StudentProfile> {
   }
   const s = studentRow.data[0] as Record<string, unknown>;
 
-  const coursesRaw = (coursesRow.data ?? []) as Array<Record<string, unknown>>;
+  const coursesRaw = rowsOrRaise(coursesRow, "courses_taken", "schema.sql");
   const completed: CompletedCourse[] = [];
   const inProgress: InProgressCourse[] = [];
   for (const row of coursesRaw) {
@@ -126,12 +188,14 @@ export async function readProfile(studentId: string): Promise<StudentProfile> {
     });
   }
 
-  const waivers = ((waiversRow.data ?? []) as Array<{ course_code: string }>).map(
-    (w) => normalizeCourse(w.course_code),
+  const waivers = rowsOrRaise(waiversRow, "student_waivers", "schema.sql").map(
+    (w) => normalizeCourse(String(w.course_code ?? "")),
   );
 
-  const transfers = (
-    (transfersRow.data ?? []) as Array<Record<string, unknown>>
+  const transfers = rowsOrRaise(
+    transfersRow,
+    "student_transfers",
+    "schema.sql",
   ).map<TransferCredit>((t) => ({
     external_course: String(t.external_course ?? ""),
     equivalent_course_code: normalizeCourse(
@@ -140,15 +204,18 @@ export async function readProfile(studentId: string): Promise<StudentProfile> {
     credits: Number(t.credits ?? 0),
   }));
 
-  const notes = ((notesRow.data ?? []) as Array<Record<string, unknown>>).map<AdvisingNote>(
-    (n) => ({
-      id: String(n.id ?? ""),
-      topic: String(n.topic ?? ""),
-      reasoning: String(n.reasoning ?? ""),
-      outcome: (n.outcome as string | null) ?? null,
-      created_at: String(n.created_at ?? ""),
-    }),
-  );
+  const notes = rowsOrRaise(
+    notesRow,
+    "advising_notes",
+    advisingNotesMigration(notesRow.error?.message ?? ""),
+  ).map<AdvisingNote>((n) => ({
+    id: String(n.id ?? ""),
+    topic: String(n.topic ?? ""),
+    reasoning: String(n.reasoning ?? ""),
+    outcome: (n.outcome as string | null) ?? null,
+    stance: coalesceStance(n.stance),
+    created_at: String(n.created_at ?? ""),
+  }));
 
   return {
     student_id: String(s.id),
@@ -182,6 +249,19 @@ function coalesceSource(raw: unknown): CompletedCourseSource {
   if (s === "waiver") return "waiver";
   if (s === "transfer") return "transfer";
   return "manual";
+}
+
+/**
+ * Rows written before phase5_migration.sql have no `stance` column, and
+ * we can't retroactively know whether those notes recorded a decision.
+ * `exploring` is the safe read: it under-claims the student's commitment
+ * rather than over-claiming it.
+ */
+function coalesceStance(raw: unknown): AdvisingNoteStance {
+  const s = String(raw ?? "").toLowerCase();
+  if (s === "decided") return "decided";
+  if (s === "advised") return "advised";
+  return "exploring";
 }
 
 // --- applyPatch -----------------------------------------------------------
@@ -372,8 +452,9 @@ export async function writeAdvisingNote(
       topic: note.topic,
       reasoning: note.reasoning,
       outcome: note.outcome ?? null,
+      stance: note.stance,
     })
-    .select("id, topic, reasoning, outcome, created_at");
+    .select("id, topic, reasoning, outcome, stance, created_at");
   if (error) {
     // Common footgun: Phase 2 migration hasn't been applied to this
     // Supabase project. Translate the raw PostgREST error into an
@@ -395,11 +476,71 @@ export async function writeAdvisingNote(
     throw new ProfileStoreError("advising_notes insert returned no rows");
   }
   const row = data[0] as Record<string, unknown>;
+  return toAdvisingNote(row);
+}
+
+function toAdvisingNote(row: Record<string, unknown>): AdvisingNote {
   return {
     id: String(row.id),
     topic: String(row.topic),
     reasoning: String(row.reasoning),
     outcome: (row.outcome as string | null) ?? null,
+    stance: coalesceStance(row.stance),
     created_at: String(row.created_at),
   };
+}
+
+// --- retractAdvisingNote --------------------------------------------------
+
+/**
+ * Soft-delete one note so it stops surfacing as advisor context.
+ *
+ * The `student_id` predicate is the authorization boundary, not an
+ * optimization: `note_id` reaches this function from an LLM tool call, so
+ * without it a hallucinated or copied UUID could retract another
+ * student's note. Scoping the UPDATE means a wrong id simply matches
+ * nothing.
+ */
+export async function retractAdvisingNote(
+  studentId: string,
+  noteId: string,
+  reason: string,
+): Promise<AdvisingNote> {
+  const sb = clientOrRaise();
+  const { data, error } = await sb
+    .from("advising_notes")
+    .update({
+      retracted_at: new Date().toISOString(),
+      retraction_reason: reason,
+    })
+    .eq("id", noteId)
+    .eq("student_id", studentId)
+    .is("retracted_at", null)
+    .select("id, topic, reasoning, outcome, stance, created_at");
+  if (error) {
+    if (
+      /retracted_at|retraction_reason/i.test(error.message) &&
+      /schema cache|does not exist|not found|column/i.test(error.message)
+    ) {
+      throw new ProfileStoreError(
+        "advising_notes is missing the retraction columns. Apply db/phase5_migration.sql via the Supabase SQL editor once, then retry.",
+        "migration_needed",
+      );
+    }
+    throw new ProfileStoreError(
+      `advising_notes retract failed: ${error.message}`,
+    );
+  }
+  // Zero rows means the id doesn't exist, belongs to another student, or
+  // was already retracted. All three are `not_found` from the caller's
+  // point of view — and none of them may report success, or the advisor
+  // will tell the student a note is gone when it isn't.
+  if (!data || data.length === 0) {
+    throw new ProfileStoreError(
+      `No live advising note ${JSON.stringify(noteId)} for this student. ` +
+        "Read the ids from get_student_profile's recent_advising_notes.",
+      "not_found",
+    );
+  }
+  return toAdvisingNote(data[0] as Record<string, unknown>);
 }

@@ -1,5 +1,9 @@
 "use client";
 
+import {
+  GenericCodesBanner,
+  type CodeNamespaceFields,
+} from "@/components/generic-codes-banner";
 import { Card, CardContent } from "@/components/ui/card";
 
 /**
@@ -9,7 +13,7 @@ import { Card, CardContent } from "@/components/ui/card";
  * lives; this is the "you're here" at-a-glance.
  */
 
-export interface CreditProgressPayload {
+export interface CreditProgressPayload extends CodeNamespaceFields {
   program_id: string;
   total_credits: number;
   remaining_credits?: number;
@@ -32,6 +36,7 @@ export function CreditProgressBar({ payload }: { payload: CreditProgressPayload 
   return (
     <Card className="mt-2">
       <CardContent className="p-4">
+        <GenericCodesBanner payload={payload} />
         <div className="flex items-baseline justify-between gap-3">
           <div>
             <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground">

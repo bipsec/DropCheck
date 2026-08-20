@@ -81,7 +81,7 @@ describe("buildAgentOptions with catalog override", () => {
     expect(opts.mcpServers?.["rules-engine"]).toBeDefined();
     expect(opts.mcpServers?.["profile-memory"]).toBeDefined();
     // Allowed tools list is unchanged.
-    expect(opts.allowedTools?.length).toBe(11);
+    expect(opts.allowedTools?.length).toBe(12);
   });
 
   it("test_build_agent_options_uses_real_catalog_by_default", async () => {

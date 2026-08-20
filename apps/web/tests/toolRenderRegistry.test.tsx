@@ -50,10 +50,10 @@ describe("tool-render-registry — hasRenderer", () => {
     expect(hasRenderer("mcp__rules-engine__impact_of_dropping")).toBe(true);
     expect(hasRenderer("mcp__rules-engine__compute_degree_progress")).toBe(true);
     expect(hasRenderer("mcp__university-catalog__get_course")).toBe(true);
+    expect(hasRenderer("mcp__rules-engine__check_prerequisites")).toBe(true);
   });
 
   it("test_registry_returns_false_for_unknown_tool", () => {
-    expect(hasRenderer("mcp__rules-engine__check_prerequisites")).toBe(false);
     expect(hasRenderer("mcp__profile-memory__get_student_profile")).toBe(false);
     expect(hasRenderer("mcp__university-catalog__search_courses")).toBe(false);
     expect(hasRenderer("nonsense")).toBe(false);
@@ -197,8 +197,8 @@ describe("tool-render-registry — renderToolResult", () => {
 
   it("test_returns_null_on_unknown_tool", () => {
     const node = renderToolResult(
-      "mcp__rules-engine__check_prerequisites",
-      contentFor({ satisfied: true }),
+      "mcp__university-catalog__search_courses",
+      contentFor({ courses: [] }),
       false,
     );
     expect(node).toBeNull();
@@ -211,5 +211,129 @@ describe("tool-render-registry — renderToolResult", () => {
       false,
     );
     expect(node).toBeNull();
+  });
+});
+
+// --- Generic code-namespace disclosure ------------------------------------
+//
+// Live testing produced a three-term plan of CS 101 / MATH 210 / PSY 101
+// that was only disclosed as non-Purdue *after* the student had read it.
+// These assert the disclosure is data-driven and can't be re-ordered away
+// by prose.
+
+describe("tool-render-registry — generic code namespace", () => {
+  it("test_build_track_renders_generic_codes_banner", () => {
+    const node = renderToolResult(
+      "mcp__rules-engine__build_track",
+      contentFor({
+        ...trackFixture,
+        code_namespace: "generic",
+        advisory: "These are generic archetype course codes.",
+      }),
+      false,
+    );
+    render(<>{node}</>);
+    expect(screen.getByTestId("generic-codes-banner")).toBeTruthy();
+    expect(screen.getByText(/not registrable/i)).toBeTruthy();
+    expect(
+      screen.getByText(/generic archetype course codes/i),
+    ).toBeTruthy();
+  });
+
+  it("test_build_track_omits_banner_for_institution_namespace", () => {
+    const node = renderToolResult(
+      "mcp__rules-engine__build_track",
+      contentFor({ ...trackFixture, code_namespace: "institution" }),
+      false,
+    );
+    render(<>{node}</>);
+    expect(screen.queryByTestId("generic-codes-banner")).toBeNull();
+  });
+
+  it("test_degree_progress_renders_generic_codes_banner", () => {
+    const node = renderToolResult(
+      "mcp__rules-engine__compute_degree_progress",
+      contentFor({
+        program_id: "cs_bs",
+        total_credits: 45,
+        remaining_credits: 75,
+        code_namespace: "generic",
+        advisory: "Archetype codes only.",
+      }),
+      false,
+    );
+    render(<>{node}</>);
+    expect(screen.getByTestId("generic-codes-banner")).toBeTruthy();
+    expect(screen.getByText(/Archetype codes only/)).toBeTruthy();
+  });
+
+  it("test_degree_progress_omits_banner_when_namespace_absent", () => {
+    // A payload predating the disclosure fields must not render a banner
+    // it has no data for.
+    const node = renderToolResult(
+      "mcp__rules-engine__compute_degree_progress",
+      contentFor({
+        program_id: "cs_bs",
+        total_credits: 45,
+        remaining_credits: 75,
+      }),
+      false,
+    );
+    render(<>{node}</>);
+    expect(screen.queryByTestId("generic-codes-banner")).toBeNull();
+  });
+});
+
+// --- Prereq provenance ----------------------------------------------------
+
+describe("tool-render-registry — prereq check provenance", () => {
+  it("test_prereq_check_shows_unverified_for_catalog_hint", () => {
+    const node = renderToolResult(
+      "mcp__rules-engine__check_prerequisites",
+      contentFor({
+        course_code: "CS 25000",
+        satisfied: true,
+        missing: [],
+        prereqs_evaluated: ["CS 18000"],
+        prereq_source: "catalog_hint",
+        confidence: "low",
+        verified: false,
+        caveat: "The prerequisite list was supplied by the caller.",
+      }),
+      false,
+    );
+    render(<>{node}</>);
+    // `satisfied: true` must NOT read as verification — the badge is the
+    // whole point of this renderer.
+    const provenance = screen.getByTestId("prereq-provenance").textContent;
+    expect(provenance).toMatch(/Not verified/);
+    expect(provenance).toMatch(/catalog prose hint/);
+    expect(provenance).toMatch(/low confidence/);
+    expect(screen.getByText(/CS 18000/)).toBeTruthy();
+    expect(screen.getByTestId("prereq-verdict").textContent).toMatch(
+      /met as given/,
+    );
+  });
+
+  it("test_prereq_check_shows_verified_for_student_asserted", () => {
+    const node = renderToolResult(
+      "mcp__rules-engine__check_prerequisites",
+      contentFor({
+        course_code: "CS 301",
+        satisfied: false,
+        missing: ["CS 201"],
+        prereqs_evaluated: ["CS 201"],
+        prereq_source: "student_asserted",
+        confidence: "high",
+        verified: true,
+      }),
+      false,
+    );
+    render(<>{node}</>);
+    const provenance = screen.getByTestId("prereq-provenance").textContent;
+    expect(provenance).toMatch(/Verified/);
+    expect(provenance).not.toMatch(/Not verified/);
+    expect(provenance).toMatch(/student-confirmed/);
+    expect(screen.getByTestId("prereq-verdict").textContent).toMatch(/not met/);
   });
 });

@@ -29,6 +29,7 @@ import {
 } from "@/lib/server/services/rulesEngine";
 import { buildTrack } from "@/lib/server/services/trackBuilder";
 import { normalizeCourse } from "@/lib/server/data/catalog";
+import { codeNamespaceOf } from "@/lib/server/data/programs";
 import {
   ProgramRequirements,
   type Track,
@@ -76,6 +77,61 @@ function coerceObject(v: unknown): unknown {
   }
 }
 
+// --- Provenance ------------------------------------------------------------
+//
+// Both check_prerequisites and impact_of_dropping take `prereqs` as an
+// INPUT. That makes them pure — but it also made them a laundering
+// channel: a low-confidence prose hint from Purdue.io went in, a
+// deterministic-looking { satisfied, missing } came out, and the advisor
+// cited the tool as proof the prereqs were right. It only ever proved the
+// arithmetic was right.
+//
+// So the caller must now declare where the list came from, and every
+// result carries that declaration back out. Prose can drift; a
+// `verified: false` field in the payload the UI renders cannot.
+
+const PrereqSource = z.enum([
+  "catalog_hint", // prerequisites_hint from api.purdue.io — free-text derived
+  "student_asserted", // the student stated these directly
+  "archetype", // structured, from one of our program fixtures
+  "assumed", // the model's own inference — the weakest case
+]);
+type PrereqSource = z.infer<typeof PrereqSource>;
+
+/** Only structured or student-confirmed lists may be called verified. */
+const VERIFIED_SOURCES: ReadonlySet<PrereqSource> = new Set<PrereqSource>([
+  "student_asserted",
+  "archetype",
+]);
+
+/**
+ * `prereq_source` is required by the schema, so the MCP boundary rejects
+ * a call that omits it. Direct handler invocation (tests, smokes, any
+ * future in-process caller) skips that validation, and an `undefined`
+ * source would drop straight out of the JSON — leaving a result with no
+ * provenance at all, which is the exact hole this block exists to close.
+ * So default to the weakest source rather than to nothing.
+ */
+function provenanceOf(source: PrereqSource | undefined): Record<string, unknown> {
+  const declared: PrereqSource = source ?? "assumed";
+  const verified = VERIFIED_SOURCES.has(declared);
+  return {
+    prereq_source: declared,
+    confidence: verified ? "high" : "low",
+    verified,
+    ...(verified
+      ? {}
+      : {
+          caveat:
+            `The prerequisite list was supplied by the caller from "${declared}" ` +
+            "and is NOT verified. This result is set arithmetic over that " +
+            "list — it says the prereqs are met as given, not that they are " +
+            'correct. Do not describe it as "verified" or "confirmed"; ask ' +
+            "the student to confirm the list instead.",
+        }),
+  };
+}
+
 // --- Tool 1: check_prerequisites ------------------------------------------
 // Given a course + its (student- or catalog-asserted) prereqs + the
 // student's completed courses, return whether the prereqs are satisfied
@@ -91,6 +147,14 @@ const checkPrereqsSchema = {
       "Prerequisite course codes for this course. Agent gathers these " +
         "from the catalog tool or from student assertion.",
     ),
+  prereq_source: PrereqSource.describe(
+    "REQUIRED. Where `prereqs` came from. " +
+      '"catalog_hint" = prerequisites_hint from get_course (low ' +
+      'confidence, prose-derived). "student_asserted" = the student told ' +
+      'you. "archetype" = a structured program fixture. "assumed" = your ' +
+      "own inference. Declare this honestly — it decides whether the " +
+      "answer may be presented as verified.",
+  ),
   completed_courses: z
     .array(z.string())
     .describe(
@@ -101,8 +165,12 @@ const checkPrereqsSchema = {
 
 const checkPrerequisites = tool(
   "check_prerequisites",
-  "Given a course code, its prerequisites, and the student's completed " +
-    "courses, return which prereqs are satisfied and which are missing.",
+  "Check the student's completed courses AGAINST THE PREREQ LIST YOU " +
+    "SUPPLY. This validates set arithmetic, not the prereq list itself: " +
+    "`satisfied: true` means the prereqs are met as given, never that they " +
+    "are correct. The result echoes back `prereq_source`, `confidence`, and " +
+    "`verified` — cite those, and never present a low-confidence result as " +
+    "verification.",
   checkPrereqsSchema,
   async (args) => {
     const target = normalizeCourse(args.course_code);
@@ -118,6 +186,10 @@ const checkPrerequisites = tool(
       course_code: target,
       satisfied: missing.length === 0,
       missing,
+      // Echo the list we actually evaluated, so the UI can show the
+      // student exactly what claim they're being asked to confirm.
+      prereqs_evaluated: args.prereqs.map(normalizeCourse).filter(Boolean),
+      ...provenanceOf(args.prereq_source),
     });
   },
 );
@@ -193,6 +265,7 @@ const computeDegreeProgress = tool(
       remaining_credits: stillNeeded,
       by_category: rem,
       by_source: sourceCounts(sat),
+      ...codeNamespaceOf(program),
     });
   },
 );
@@ -226,6 +299,12 @@ const impactSchema = {
         "the plan (not yet completed). Each carries its own prereq " +
         "list. Accepts either a JSON array or a stringified array.",
     ),
+  prereq_source: PrereqSource.describe(
+    "REQUIRED. Where the `prereqs` inside `remaining_courses` came from. " +
+      "The drop cascade is exactly as trustworthy as that data — a " +
+      '"catalog_hint" or "assumed" source means the blocked-course list ' +
+      "is provisional and must be presented that way.",
+  ),
   program_requirements: z
     .unknown()
     .optional()
@@ -239,7 +318,11 @@ const impactOfDropping = tool(
   "impact_of_dropping",
   "Given a candidate drop and the remaining courses in the plan, list " +
     "the downstream courses that become blocked and (rarely) any that " +
-    "become unblocked.",
+    "become unblocked. The cascade is computed from the prereq lists you " +
+    "supply, so the result echoes `prereq_source` / `confidence` / " +
+    "`verified` — a low-confidence cascade is a provisional answer, not a " +
+    "confirmed one. Calling this tool does not record any decision; the " +
+    "student asking about a drop is still just exploring.",
   impactSchema,
   async (args) => {
     const target = normalizeCourse(args.course_code);
@@ -301,6 +384,7 @@ const impactOfDropping = tool(
       unblocked_by_removal: [],
       now_blocked: [...nowBlocked].sort(),
       categoriesAtRisk,
+      ...provenanceOf(args.prereq_source),
     });
   },
 );
@@ -372,7 +456,10 @@ const buildTrackTool = tool(
       startTerm: args.start_term,
     });
 
-    return ok({ ...track });
+    // `Track` is a strict schema built by buildTrack, so the namespace
+    // fields ride alongside it on the wire rather than inside it — no
+    // scheduler or Track-schema churn for a disclosure concern.
+    return ok({ ...track, ...codeNamespaceOf(program) });
   },
 );
 
